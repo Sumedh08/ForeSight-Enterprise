@@ -58,16 +58,6 @@ docker compose up -d --build
 
 ---
 
-## Visual Walkthrough 
-
-| Section | Description | Placeholder |
-| :--- | :--- | :--- |
-| **Command Center** | The main dashboard showing the chat interface and health badges. | ![Dashboard Placeholder](https://via.placeholder.com/800x400?text=Analytics+Command+Center) |
-| **Connection Wizard** | The UI where you add and test new PostgreSQL/MySQL connections. | ![Connection Placeholder](https://via.placeholder.com/800x400?text=Database+Connection+Wizard) |
-| **Forecasting Artifacts** | A chart showing a MindsDB-generated forecast inside the chat. | ![Forecast Placeholder](https://via.placeholder.com/800x400?text=Predictive+Forecast+Charting) |
-| **Safety Guardrails** | A screenshot showing the SQL validation blocking a harmful query. | ![Safety Placeholder](https://via.placeholder.com/800x400?text=SQL+Security+Guardrails) |
-
----
 
 ## Future Roadmap
 - **AI Agnosticism**: Expanding provider support to include **Ollama** for local-first inference and custom API keys for enterprise LLM gateways.
