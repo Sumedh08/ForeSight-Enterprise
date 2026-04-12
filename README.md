@@ -58,10 +58,7 @@ docker compose up -d --build
 
 ---
 
-## Visual Walkthrough (Action Required)
-
-> [!NOTE]
-> **To the User**: Please replace the placeholders below with your actual screenshots for the final submission.
+## Visual Walkthrough 
 
 | Section | Description | Placeholder |
 | :--- | :--- | :--- |
