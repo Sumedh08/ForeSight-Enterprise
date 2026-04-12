@@ -1,0 +1,3 @@
+CREATE DATABASE airflow;
+CREATE DATABASE cube_db;
+CREATE DATABASE mindsdb_db;

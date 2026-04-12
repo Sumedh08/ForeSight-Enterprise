@@ -1,0 +1,1 @@
+"""Benchmark-ready component package."""
