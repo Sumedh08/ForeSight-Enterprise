@@ -5,10 +5,10 @@ Usage: python -m infra.migrate_to_postgres
 import duckdb
 import pandas as pd
 from sqlalchemy import create_engine, text
-import sys
+from infra.settings import settings
 
-DUCKDB_PATH = "data/demo.duckdb"
-PG_DSN = "postgresql://admin:adminpassword@localhost:5432/natwest_db"
+DUCKDB_PATH = str(settings.duckdb_path)
+PG_DSN = settings.postgres_dsn or "postgresql://admin:adminpassword@postgres:5432/natwest_db"
 
 
 def migrate():

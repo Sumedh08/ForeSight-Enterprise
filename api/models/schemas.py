@@ -5,6 +5,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+ConnectionType = Literal["postgres", "mysql", "sqlite", "duckdb"]
+
+
 class WarningItem(BaseModel):
     kind: Literal["data_quality", "model_risk", "safety_block", "degraded_mode", "performance"]
     message: str
@@ -12,7 +15,7 @@ class WarningItem(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    mode: Literal["auto", "sql", "forecast", "anomaly"] = "auto"
+    mode: Literal["auto", "sql", "forecast", "anomaly", "scenario"] = "auto"
     filters: dict[str, Any] | None = None
     series_id: str | None = None
     metric: str | None = None
@@ -62,3 +65,47 @@ class QueryResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     components: dict[str, str]
+    active_connection: str | None = None
+    active_connection_type: ConnectionType | None = None
+
+
+class ConnectionTestRequest(BaseModel):
+    connection_type: ConnectionType
+    config: dict[str, Any]
+
+
+class ConnectionSaveRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    connection_type: ConnectionType
+    config: dict[str, Any]
+    activate: bool = True
+
+
+class ConnectionProfileResponse(BaseModel):
+    id: str
+    name: str
+    connection_type: ConnectionType
+    active: bool
+    config: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class ConnectionListResponse(BaseModel):
+    active_profile_id: str | None
+    profiles: list[ConnectionProfileResponse]
+
+
+class ConnectionTestResponse(BaseModel):
+    status: Literal["ok", "failed"]
+    message: str
+    dialect: str | None = None
+    table_count: int | None = None
+    tables: list[str] = Field(default_factory=list)
+
+
+class UploadResponse(BaseModel):
+    status: Literal["ok", "degraded", "failed"]
+    message: str
+    table_name: str | None = None
+    warnings: list[str] = Field(default_factory=list)

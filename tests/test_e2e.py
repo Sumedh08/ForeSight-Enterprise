@@ -1,35 +1,32 @@
-import httpx
-import json
-import time
+from __future__ import annotations
 
-API = "http://127.0.0.1:8000"
+import pytest
 
-# Query forecast (data already in DuckDB from previous upload)
-print("=== Querying bitcoin forecast ===")
-start = time.time()
-resp = httpx.post(f"{API}/query", json={"question": "What will be price of bitcoin in 1 May 2026?", "mode": "auto"}, timeout=300)
-elapsed = time.time() - start
-print(f"Query status: {resp.status_code}")
-data = resp.json()
-print(f"Task type: {data.get('task_type')}")
-print(f"Status: {data.get('status')}")
-print(f"Confidence: {data.get('confidence')}")
-print(f"Answer: {data.get('answer')[:500]}")
-print(f"Time: {elapsed:.1f}s")
 
-# Check artifacts
-arts = data.get("artifacts", {})
-if arts:
-    pf = arts.get("point_forecast", [])
-    print(f"\nForecast points: {len(pf)}")
-    for p in pf[:3]:
-        print(f"  {p}")
-else:
-    print("\nNo artifacts returned")
-    
-# Check warnings
-warns = data.get("warnings", [])
-if warns:
-    print(f"\nWarnings:")
-    for w in warns:
-        print(f"  {w}")
+fastapi = pytest.importorskip("fastapi")
+pytest.importorskip("duckdb")
+pytest.importorskip("sqlalchemy")
+
+from fastapi.testclient import TestClient
+
+from api.main import app
+
+
+def test_health_endpoint_contract():
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] in {"ok", "degraded"}
+    assert isinstance(body.get("components"), dict)
+    assert "database" in body["components"]
+
+
+def test_connection_list_contract():
+    client = TestClient(app)
+    response = client.get("/api/connections")
+    assert response.status_code == 200
+    body = response.json()
+    assert "profiles" in body
+    assert isinstance(body["profiles"], list)
+    assert body["profiles"], "Expected at least one default connection profile."

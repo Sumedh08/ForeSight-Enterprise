@@ -1,257 +1,289 @@
 from __future__ import annotations
 
 import os
+from typing import Any
+
 import altair as alt
 import httpx
 import pandas as pd
 import streamlit as st
 
+
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
 
-def _render_forecast(artifacts: dict) -> tuple:
-    """Render forecast chart with historical data overlay, prediction bands, and baseline."""
-    point_df = pd.DataFrame(artifacts.get("point_forecast", []))
-    interval_df = pd.DataFrame(artifacts.get("prediction_intervals", []))
-    baseline_df = pd.DataFrame(artifacts.get("baseline", []))
-    anomaly_df = pd.DataFrame(artifacts.get("anomalies", []))
-
-    for frame in (point_df, interval_df, baseline_df, anomaly_df):
-        if not frame.empty and "period" in frame.columns:
-            frame["period"] = pd.to_datetime(frame["period"])
-
-    layers = []
-
-    # Historical + baseline as gray dashed line
-    if not baseline_df.empty and "value" in baseline_df.columns:
-        history_line = alt.Chart(baseline_df).mark_line(color="#9E9E9E", strokeDash=[4, 3]).encode(
-            x="period:T",
-            y="value:Q",
-            tooltip=[alt.Tooltip("period:T", title="Date"), alt.Tooltip("value:Q", title="Value")]
-        )
-        layers.append(history_line)
-
-    # Prediction interval band
-    if not interval_df.empty and "low_80" in interval_df.columns:
-        band = alt.Chart(interval_df).mark_area(opacity=0.2, color="#2E8B57").encode(
-            x="period:T",
-            y="low_80:Q",
-            y2="high_80:Q",
-        )
-        layers.append(band)
-
-    # Point forecast line
-    if not point_df.empty:
-        point = alt.Chart(point_df).mark_line(color="#2196F3", point=True).encode(
-            x="period:T",
-            y="value:Q",
-            tooltip=[alt.Tooltip("period:T", title="Date"), alt.Tooltip("value:Q", title="Forecast")]
-        )
-        layers.append(point)
-
-    # Anomaly markers
-    if not anomaly_df.empty and "actual" in anomaly_df.columns:
-        anomaly_dots = alt.Chart(anomaly_df).mark_circle(size=120, color="red").encode(
-            x="period:T",
-            y="actual:Q",
-            tooltip=[alt.Tooltip("period:T", title="Date"), alt.Tooltip("actual:Q", title="Value"), alt.Tooltip("severity:N")]
-        )
-        layers.append(anomaly_dots)
-
-    chart = alt.layer(*layers).properties(height=350, title="Forecast") if layers else None
-    return chart, point_df if not point_df.empty else None
+def api_get(path: str) -> dict[str, Any]:
+    response = httpx.get(f"{API_URL}{path}", timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
-def _render_scenario(artifacts: dict) -> tuple:
-    """Render scenario comparison chart with baseline and scenario lines + bands."""
-    base_df = pd.DataFrame(artifacts.get("baseline_forecast", []))
-    scen_df = pd.DataFrame(artifacts.get("scenario_forecast", []))
-    base_int = pd.DataFrame(artifacts.get("baseline_intervals", []))
-    scen_int = pd.DataFrame(artifacts.get("scenario_intervals", []))
+def api_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    response = httpx.post(f"{API_URL}{path}", json=payload, timeout=60)
+    response.raise_for_status()
+    return response.json()
 
-    for frame in (base_df, scen_df, base_int, scen_int):
-        if not frame.empty and "period" in frame.columns:
-            frame["period"] = pd.to_datetime(frame["period"])
+
+def render_sql_table(artifacts: dict[str, Any]) -> pd.DataFrame | None:
+    frame = pd.DataFrame(artifacts.get("preview_rows", []))
+    return frame if not frame.empty else None
+
+
+def render_forecast_chart(artifacts: dict[str, Any]) -> alt.Chart | None:
+    points = pd.DataFrame(artifacts.get("point_forecast", []))
+    intervals = pd.DataFrame(artifacts.get("prediction_intervals", []))
+    if points.empty and intervals.empty:
+        return None
 
     layers = []
-
-    # Baseline band
-    if not base_int.empty and "low_80" in base_int.columns:
-        layers.append(alt.Chart(base_int).mark_area(opacity=0.15, color="#2196F3").encode(
-            x="period:T", y="low_80:Q", y2="high_80:Q",
-        ))
-
-    # Scenario band
-    if not scen_int.empty and "low_80" in scen_int.columns:
-        layers.append(alt.Chart(scen_int).mark_area(opacity=0.15, color="#FF9800").encode(
-            x="period:T", y="low_80:Q", y2="high_80:Q",
-        ))
-
-    # Baseline line
-    if not base_df.empty:
-        base_df["label"] = "Baseline"
-        layers.append(alt.Chart(base_df).mark_line(color="#2196F3", point=True).encode(
-            x="period:T", y="value:Q",
-            tooltip=[alt.Tooltip("period:T"), alt.Tooltip("value:Q", title="Baseline")]
-        ))
-
-    # Scenario line
-    if not scen_df.empty:
-        scen_df["label"] = "Scenario"
-        layers.append(alt.Chart(scen_df).mark_line(color="#FF9800", point=True, strokeDash=[6, 3]).encode(
-            x="period:T", y="value:Q",
-            tooltip=[alt.Tooltip("period:T"), alt.Tooltip("value:Q", title="Scenario")]
-        ))
-
-    chart = alt.layer(*layers).properties(height=350, title="Scenario Comparison") if layers else None
-    combined = None
-    if not base_df.empty and not scen_df.empty:
-        combined = base_df[["period", "value"]].rename(columns={"value": "baseline"}).merge(
-            scen_df[["period", "value"]].rename(columns={"value": "scenario"}), on="period", how="outer"
+    if not intervals.empty and {"period", "low_80", "high_80"}.issubset(intervals.columns):
+        intervals["period"] = pd.to_datetime(intervals["period"])
+        layers.append(
+            alt.Chart(intervals)
+            .mark_area(opacity=0.2, color="#5E9")
+            .encode(x="period:T", y="low_80:Q", y2="high_80:Q")
         )
-    return chart, combined
+
+    if not points.empty and {"period", "value"}.issubset(points.columns):
+        points["period"] = pd.to_datetime(points["period"])
+        layers.append(
+            alt.Chart(points)
+            .mark_line(point=True, color="#2B6CB0")
+            .encode(
+                x="period:T",
+                y="value:Q",
+                tooltip=[alt.Tooltip("period:T", title="Period"), alt.Tooltip("value:Q", title="Value")],
+            )
+        )
+
+    if not layers:
+        return None
+    return alt.layer(*layers).properties(height=320, title="Forecast")
 
 
-def _render_anomaly(artifacts: dict) -> tuple:
-    """Render anomaly chart with history and red markers for anomalous points."""
-    history_df = pd.DataFrame(artifacts.get("baseline", []))
-    anomaly_df = pd.DataFrame(artifacts.get("anomalies", []))
-
-    for frame in (history_df, anomaly_df):
-        if not frame.empty and "period" in frame.columns:
-            frame["period"] = pd.to_datetime(frame["period"])
+def render_scenario_chart(artifacts: dict[str, Any]) -> alt.Chart | None:
+    baseline = pd.DataFrame(artifacts.get("baseline_forecast", []))
+    scenario = pd.DataFrame(artifacts.get("scenario_forecast", []))
+    if baseline.empty and scenario.empty:
+        return None
 
     layers = []
-    if not history_df.empty and "value" in history_df.columns:
-        layers.append(alt.Chart(history_df).mark_line(color="#607D8B", point=False).encode(
-            x="period:T", y="value:Q",
-            tooltip=[alt.Tooltip("period:T", title="Date"), alt.Tooltip("value:Q", title="Value")]
-        ))
-
-    if not anomaly_df.empty and "actual" in anomaly_df.columns:
-        layers.append(alt.Chart(anomaly_df).mark_circle(size=150, color="red").encode(
-            x="period:T", y="actual:Q",
-            tooltip=[
-                alt.Tooltip("period:T", title="Date"),
-                alt.Tooltip("actual:Q", title="Value"),
-                alt.Tooltip("severity:N", title="Severity"),
-                alt.Tooltip("direction:N", title="Type"),
-                alt.Tooltip("explanation:N", title="Detail"),
-            ]
-        ))
-
-    chart = alt.layer(*layers).properties(height=350, title="Anomaly Detection") if layers else None
-    return chart, anomaly_df if not anomaly_df.empty else None
+    if not baseline.empty:
+        baseline["period"] = pd.to_datetime(baseline["period"])
+        layers.append(
+            alt.Chart(baseline)
+            .mark_line(point=True, color="#2B6CB0")
+            .encode(x="period:T", y="value:Q", tooltip=["period:T", "value:Q"])
+        )
+    if not scenario.empty:
+        scenario["period"] = pd.to_datetime(scenario["period"])
+        layers.append(
+            alt.Chart(scenario)
+            .mark_line(point=True, color="#D97706", strokeDash=[6, 3])
+            .encode(x="period:T", y="value:Q", tooltip=["period:T", "value:Q"])
+        )
+    return alt.layer(*layers).properties(height=320, title="Scenario Comparison")
 
 
-# ── Streamlit App ──────────────────────────────────────────────────────
+def render_anomaly_chart(artifacts: dict[str, Any]) -> alt.Chart | None:
+    baseline = pd.DataFrame(artifacts.get("baseline", []))
+    anomalies = pd.DataFrame(artifacts.get("anomalies", []))
+    if baseline.empty:
+        return None
 
-st.set_page_config(page_title="AI Forecast Assistant", layout="wide")
-st.title("AI Predictive Forecasting")
+    baseline["period"] = pd.to_datetime(baseline["period"])
+    line = alt.Chart(baseline).mark_line(color="#64748B").encode(x="period:T", y="value:Q")
+    if anomalies.empty:
+        return line.properties(height=320, title="Anomaly Scan")
 
-if "data_loaded" not in st.session_state:
-    st.session_state.data_loaded = False
+    anomalies["period"] = pd.to_datetime(anomalies["period"])
+    dots = alt.Chart(anomalies).mark_circle(size=110, color="#DC2626").encode(
+        x="period:T",
+        y="actual:Q",
+        tooltip=["period:T", "actual:Q", "severity:N", "direction:N"],
+    )
+    return alt.layer(line, dots).properties(height=320, title="Anomaly Scan")
+
+
+def render_component_status(components: dict[str, str]) -> None:
+    for name, state in components.items():
+        if state == "up":
+            st.success(f"{name}: up")
+        else:
+            st.warning(f"{name}: {state}")
+
+
+def build_config(connection_type: str) -> dict[str, Any]:
+    if connection_type in {"duckdb", "sqlite"}:
+        path = st.text_input("Database Path", value="data/demo.duckdb" if connection_type == "duckdb" else "data/local.sqlite")
+        return {"path": path}
+
+    mode = st.radio("Connection Input", options=["Fields", "DSN"], horizontal=True, key=f"{connection_type}_mode")
+    if mode == "DSN":
+        dsn = st.text_input("DSN", value="", placeholder="postgresql+psycopg2://user:pass@host:5432/db")
+        return {"dsn": dsn}
+
+    host = st.text_input("Host", value="postgres")
+    port_default = 5432 if connection_type == "postgres" else 3306
+    port = st.number_input("Port", value=port_default, step=1)
+    database = st.text_input("Database", value="natwest_db")
+    username = st.text_input("Username", value="admin")
+    password = st.text_input("Password", value="", type="password")
+    return {
+        "host": host,
+        "port": int(port),
+        "database": database,
+        "username": username,
+        "password": password,
+    }
+
+
+st.set_page_config(page_title="AI Forecast Platform", layout="wide")
+st.title("AI Predictive Forecast Platform")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 with st.sidebar:
-    st.header("1. Connect Data")
-    uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
-    if st.button("Upload & Connect") and uploaded_file is not None:
-        with st.spinner("Uploading and analyzing schema..."):
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-            resp = httpx.post(f"{API_URL}/api/data/upload", files=files, timeout=60)
-            if resp.status_code == 200:
-                st.success(resp.json()["message"])
-                st.session_state.data_loaded = True
-            else:
-                st.error(f"Error: {resp.text}")
+    st.header("Connection Wizard")
+    try:
+        health = api_get("/health")
+        st.caption(
+            f"Active: {health.get('active_connection') or 'none'} "
+            f"({health.get('active_connection_type') or 'n/a'})"
+        )
+        render_component_status(health.get("components", {}))
+    except Exception as exc:
+        st.error(f"Health check failed: {exc}")
 
-# Always show chat — the backend will respond appropriately if no data is loaded
+    try:
+        connections = api_get("/api/connections")
+    except Exception as exc:
+        st.error(f"Could not load connections: {exc}")
+        connections = {"profiles": [], "active_profile_id": None}
+
+    profiles = connections.get("profiles", [])
+    if profiles:
+        profile_labels = [f"{item['name']} ({item['connection_type']})" for item in profiles]
+        selected = st.selectbox("Saved Profiles", options=profile_labels)
+        selected_index = profile_labels.index(selected)
+        selected_profile = profiles[selected_index]
+        if st.button("Activate Selected Profile"):
+            try:
+                api_post(f"/api/connections/{selected_profile['id']}/activate", {})
+                st.success("Profile activated.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Activation failed: {exc}")
+
+    st.subheader("New Connection")
+    profile_name = st.text_input("Profile Name", value="my-connection")
+    connection_type = st.selectbox("Connection Type", options=["postgres", "mysql", "sqlite", "duckdb"])
+    config = build_config(connection_type)
+
+    col_test, col_save = st.columns(2)
+    with col_test:
+        if st.button("Test Connection"):
+            try:
+                result = api_post("/api/connections/test", {"connection_type": connection_type, "config": config})
+                if result.get("status") == "ok":
+                    st.success(
+                        f"Connected ({result.get('dialect')}) with {result.get('table_count', 0)} table(s)."
+                    )
+                else:
+                    st.error(result.get("message", "Connection failed."))
+            except Exception as exc:
+                st.error(f"Test failed: {exc}")
+    with col_save:
+        if st.button("Save and Activate"):
+            try:
+                api_post(
+                    "/api/connections",
+                    {
+                        "name": profile_name,
+                        "connection_type": connection_type,
+                        "config": config,
+                        "activate": True,
+                    },
+                )
+                st.success("Connection profile saved and activated.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Save failed: {exc}")
+
+    st.subheader("Upload Dataset")
+    uploaded_file = st.file_uploader("CSV / Excel", type=["csv", "xlsx", "xls"])
+    if st.button("Upload into Active DB") and uploaded_file is not None:
+        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+        try:
+            response = httpx.post(f"{API_URL}/api/data/upload", files=files, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            st.success(data.get("message", "Upload complete."))
+            for item in data.get("warnings", []):
+                st.warning(item)
+        except Exception as exc:
+            st.error(f"Upload failed: {exc}")
+
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("chart") is not None:
-            st.altair_chart(message["chart"])
-        if message.get("dataframe") is not None:
-            st.dataframe(message["dataframe"])
+            st.altair_chart(message["chart"], use_container_width=True)
+        if message.get("table") is not None:
+            st.dataframe(message["table"], use_container_width=True)
 
-if prompt := st.chat_input("Ask a question (e.g., 'Forecast bitcoin price for next 4 weeks')"):
+prompt = st.chat_input("Ask a question about your connected data")
+if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("Thinking...")
-
-        payload = {
-            "question": prompt,
-            "mode": "auto"
-        }
-
+        placeholder = st.empty()
+        placeholder.markdown("Running query...")
         try:
-            response = httpx.post(f"{API_URL}/query", json=payload, timeout=180)
-            if response.status_code == 200:
-                data = response.json()
-                answer_text = data.get("answer", "")
-                task_type = data.get("task_type", "")
-                confidence = data.get("confidence", 0)
-                artifacts = data.get("artifacts")
+            payload = {"question": prompt, "mode": "auto"}
+            response = api_post("/query", payload)
+            answer = response.get("answer", "No answer returned.")
+            confidence = response.get("confidence")
+            if confidence is not None:
+                answer = f"Confidence: {int(float(confidence) * 100)}%\n\n{answer}"
+            placeholder.markdown(answer)
 
-                # Add confidence badge
-                if confidence > 0:
-                    conf_pct = int(confidence * 100)
-                    if conf_pct >= 70:
-                        badge = f"🟢 Confidence: {conf_pct}%"
-                    elif conf_pct >= 40:
-                        badge = f"🟡 Confidence: {conf_pct}%"
-                    else:
-                        badge = f"🔴 Confidence: {conf_pct}%"
-                    answer_text = f"{badge}\n\n{answer_text}"
+            chart = None
+            table = None
+            artifacts = response.get("artifacts")
+            task_type = response.get("task_type")
+            if artifacts:
+                if task_type == "sql":
+                    table = render_sql_table(artifacts)
+                elif task_type == "forecast":
+                    chart = render_forecast_chart(artifacts)
+                    table = pd.DataFrame(artifacts.get("point_forecast", []))
+                elif task_type == "scenario":
+                    chart = render_scenario_chart(artifacts)
+                    table = pd.DataFrame(artifacts.get("scenario_forecast", []))
+                elif task_type == "anomaly":
+                    chart = render_anomaly_chart(artifacts)
+                    table = pd.DataFrame(artifacts.get("anomalies", []))
 
-                message_placeholder.markdown(answer_text)
+            for item in response.get("warnings", []):
+                if isinstance(item, dict):
+                    st.warning(f"{item.get('kind')}: {item.get('message')}")
 
-                chart = None
-                df = None
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True)
+            if table is not None and not table.empty:
+                st.dataframe(table, use_container_width=True)
 
-                if task_type == "forecast" and artifacts:
-                    chart, df = _render_forecast(artifacts)
-                elif task_type == "scenario" and artifacts:
-                    chart, df = _render_scenario(artifacts)
-                elif task_type == "anomaly" and artifacts:
-                    chart, df = _render_anomaly(artifacts)
-                elif task_type == "sql" and artifacts:
-                    df = pd.DataFrame(artifacts.get("preview_rows", []))
-
-                if chart is not None:
-                    st.altair_chart(chart)
-                if df is not None and not df.empty:
-                    st.dataframe(df)
-
-                # Backtest expander for forecast artifacts
-                if task_type == "forecast" and artifacts and artifacts.get("backtest_metrics"):
-                    bt = artifacts["backtest_metrics"]
-                    with st.expander("📊 Backtest & Model Transparency"):
-                        cols = st.columns(4)
-                        cols[0].metric("MAE", f"{bt.get('mae', 'N/A'):.2f}" if bt.get("mae") else "N/A")
-                        cols[1].metric("MAPE", f"{bt.get('mape', 0):.1%}" if bt.get("mape") else "N/A")
-                        cols[2].metric("80% Coverage", f"{bt.get('coverage_80', 0):.0%}" if bt.get("coverage_80") else "N/A")
-                        cols[3].metric("Beats Baseline", "✅ Yes" if bt.get("beats_baseline") else "⚠️ No")
-
-                # CSV download
-                if df is not None and not df.empty:
-                    csv_data = df.to_csv(index=False)
-                    st.download_button("📥 Download as CSV", csv_data, "forecast_results.csv", "text/csv")
-
-                st.session_state.messages.append({
+            st.session_state.messages.append(
+                {
                     "role": "assistant",
-                    "content": answer_text,
+                    "content": answer,
                     "chart": chart,
-                    "dataframe": df
-                })
-            else:
-                error_text = f"Error: Server responded with {response.status_code}"
-                message_placeholder.error(error_text)
-        except Exception as e:
-            message_placeholder.error(f"Failed to connect to API: {str(e)}")
+                    "table": table,
+                }
+            )
+        except Exception as exc:
+            placeholder.error(f"Query failed: {exc}")

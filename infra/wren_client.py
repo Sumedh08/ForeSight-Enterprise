@@ -1,72 +1,106 @@
 """
-Wren AI Enterprise Client
-Integrates the backend with the Wren AI Semantic Engine and Cube.js.
-Supports schema-agnostic Text-to-SQL and Semantic discovery.
+Wren AI Client
+Generates SQL through Wren AI and exposes lightweight health checks.
 """
+from __future__ import annotations
+
+import re
+from typing import Any
+
 import httpx
-import logging
-import time
-from typing import Any, Dict, List, Optional
+
 from infra.settings import settings
 
-logger = logging.getLogger(__name__)
+
+def _extract_sql(text: str) -> str:
+    candidate = text.strip()
+    if "```sql" in candidate.lower():
+        start = candidate.lower().find("```sql")
+        candidate = candidate[start + 6 :]
+        candidate = candidate.split("```", 1)[0]
+    elif "```" in candidate:
+        candidate = candidate.split("```", 1)[1].split("```", 1)[0]
+    candidate = candidate.strip().strip("`")
+    if candidate.upper().startswith(("SELECT", "WITH")):
+        return candidate.rstrip(";")
+
+    lines = [line.strip() for line in candidate.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.upper().startswith(("SELECT", "WITH")):
+            return line.rstrip(";")
+    return candidate.rstrip(";")
+
 
 class WrenClient:
-    def __init__(self):
-        # engine is on 8081 (mapped from 8080 internal)
-        self.engine_url = "http://localhost:8081"
-        self.ai_service_url = "http://localhost:5555"
-        self.timeout = 180.0
+    def __init__(self) -> None:
+        self.engine_url = settings.wren_engine_url.rstrip("/")
+        self.ai_service_url = settings.wren_ai_service_url.rstrip("/")
+        self.timeout_s = 90.0
 
-    async def generate_sql(self, question: str, context: Optional[str] = None) -> str:
-        """
-        Submits a natural language question to Wren AI and returns the generated SQL.
-        Wren AI is connected to Cube.js, ensuring it respects the semantic layer.
-        """
-        # Note: In a production setup, we first call the AI service to get the 'Intent'
-        # and then the Engine to get the 'SQL'.
-        
-        # 1. Ask Wren AI Service for the SQL based on the semantic models (Cubes)
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = client.post(
-                    f"{self.ai_service_url}/v1/chat/completions",
-                    json={
-                        "messages": [{"role": "user", "content": question}],
-                        "model": "wren-ai",
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                # Wren usually returns the SQL or a recommendation of Cube measures/dimensions
-                return data.get("sql", "")
-        except Exception as e:
-            logger.error(f"Wren AI SQL Generation failed: {e}")
-            raise
+    async def health(self) -> dict[str, str]:
+        ai_status = "degraded"
+        engine_status = "degraded"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            try:
+                ai_response = await client.get(f"{self.ai_service_url}/health")
+                if ai_response.status_code < 500:
+                    ai_status = "up"
+            except Exception:
+                ai_status = "degraded"
+            try:
+                engine_response = await client.get(f"{self.engine_url}/health")
+                if engine_response.status_code < 500:
+                    engine_status = "up"
+            except Exception:
+                engine_status = "degraded"
+        return {"wren_ai": ai_status, "wren_engine": engine_status}
 
-    async def execute_semantic_query(self, query: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Executes a query directly against the Cube.js / Wren Engine.
-        This provides cached and aggregated results.
-        """
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = client.post(
-                    f"{self.engine_url}/v1/query",
-                    json=query
-                )
-                response.raise_for_status()
-                return response.json().get("data", [])
-        except Exception as e:
-            logger.error(f"Semantic query execution failed: {e}")
-            return []
+    async def generate_sql(self, question: str, *, schema_context: str | None = None) -> str:
+        system_context = (
+            "You are a production text-to-SQL system. "
+            "Return only executable SQL (no markdown, no explanation). "
+            "Use only tables/columns present in schema context."
+        )
+        if schema_context:
+            system_context += f"\n\nSchema context:\n{schema_context}"
 
-    async def register_datasource(self):
-        """
-        Registers the Postgres datasource in Wren AI. 
-        Wren AI will then scan the schema and prepare for Text-to-SQL.
-        """
-        pass # To be implemented once Engine is healthy
+        payload = {
+            "model": "wren-ai",
+            "messages": [
+                {"role": "system", "content": system_context},
+                {"role": "user", "content": question},
+            ],
+            "temperature": 0.0,
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            response = await client.post(f"{self.ai_service_url}/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            body = response.json()
+
+        content = ""
+        if isinstance(body, dict):
+            choices = body.get("choices")
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message", {})
+                content = str(message.get("content", "")).strip()
+            if not content and isinstance(body.get("sql"), str):
+                content = str(body.get("sql", "")).strip()
+        if not content:
+            raise RuntimeError("Wren did not return SQL content.")
+
+        sql = _extract_sql(content)
+        if not sql or not re.match(r"^\s*(SELECT|WITH)\b", sql, flags=re.IGNORECASE):
+            raise RuntimeError("Wren response did not contain a valid read-only SQL query.")
+        return sql
+
+    async def execute_semantic_query(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            response = await client.post(f"{self.engine_url}/v1/query", json=query)
+            response.raise_for_status()
+            payload = response.json()
+        data = payload.get("data", [])
+        return data if isinstance(data, list) else []
+
 
 wren_client = WrenClient()

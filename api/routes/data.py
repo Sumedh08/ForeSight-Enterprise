@@ -1,59 +1,78 @@
 from __future__ import annotations
 
-import os
 import shutil
+from pathlib import Path
 
-from sqlalchemy import create_engine, text
+import pandas as pd
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Request, UploadFile
 
-@router.post("/upload")
-async def upload_file(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    if not (file.filename.endswith(".csv") or file.filename.endswith(".xlsx") or file.filename.endswith(".xls")):
-        raise HTTPException(status_code=400, detail="Only CSV and Excel files are supported")
-    
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = settings.data_dir / file.filename
-    with open(temp_path, "wb") as buffer:
+from api.models.schemas import UploadResponse
+from infra.data_ingestion import sanitize_table_name, write_dataframe_to_profile
+from infra.settings import settings
+
+
+router = APIRouter()
+
+
+@router.post("/upload", response_model=UploadResponse)
+async def upload_file(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> UploadResponse:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="A filename is required.")
+    lowered_name = file.filename.lower()
+    if not (lowered_name.endswith(".csv") or lowered_name.endswith(".xlsx") or lowered_name.endswith(".xls")):
+        raise HTTPException(status_code=400, detail="Only CSV and Excel files are supported.")
+
+    settings.ensure_directories()
+    safe_filename = Path(file.filename).name
+    temp_path = settings.data_dir / safe_filename
+    with temp_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-        
-    try:
-        table_name = file.filename.split(".")[0].replace("-", "_").replace(" ", "_").lower()
-        # Use PostgreSQL instead of DuckDB
-        pg_url = "postgresql://admin:adminpassword@localhost:5432/natwest_db"
-        engine = create_engine(pg_url)
-        
-        if file.filename.endswith(".csv"):
-            df = pd.read_csv(temp_path)
-        else:
-            df = pd.read_excel(temp_path)
-            
-        df.to_sql(table_name, engine, if_exists="replace", index=False)
-            
-        # Notify services of new data for schema-agnostic discovery
-        if hasattr(request.app.state, "services"):
-            request.app.state.services.refresh_schema()
-            
-        # NEW: Trigger MindsDB & Cube Discovery via Airflow or Background Task
-        from infra.mindsdb_dynamic_setup import setup_mindsdb_datasource, discover_and_train
-        background_tasks.add_task(setup_mindsdb_datasource)
-        background_tasks.add_task(discover_and_train)
 
-    except Exception as e:
-        logger.exception("Upload failed")
-        raise HTTPException(status_code=500, detail=str(e))
-    
+    profile_manager = request.app.state.services.connection_manager
+    airflow_client = request.app.state.services.airflow_client
+    warnings: list[str] = []
+    try:
+        if lowered_name.endswith(".csv"):
+            frame = pd.read_csv(temp_path)
+        else:
+            frame = pd.read_excel(temp_path)
+
+        active_profile = profile_manager.get_active_profile()
+        table_name = sanitize_table_name(safe_filename.rsplit(".", 1)[0])
+        table_name = write_dataframe_to_profile(
+            profile=active_profile,
+            frame=frame,
+            table_name=table_name,
+            profile_manager=profile_manager,
+        )
+
+        def trigger_sync() -> None:
+            try:
+                airflow_client.trigger_dynamic_discovery_sync(
+                    connection_profile=active_profile,
+                    tables=[table_name],
+                )
+            except Exception:
+                # Upload success should not fail because offline orchestration is unavailable.
+                pass
+
+        background_tasks.add_task(trigger_sync)
+        warnings.append("Offline model sync was queued in Airflow (if available).")
+        return UploadResponse(
+            status="ok",
+            message=f"Data uploaded successfully to `{table_name}` using the active profile.",
+            table_name=table_name,
+            warnings=warnings,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
     finally:
         if temp_path.exists():
             temp_path.unlink()
-    
-    return {"status": "ok", "message": f"Data successfully loaded into Postgres table `{table_name}`"}
-    
-    # Clean up temp file safely after connection closure
-    try:
-        if temp_path.exists():
-            temp_path.unlink()
-    except Exception as e:
-        logger.warning(f"Could not delete temp file {temp_path}: {e}")
-    
-    return {"status": "ok", "message": f"Data successfully loaded into table `{table_name}`"}
-
-
