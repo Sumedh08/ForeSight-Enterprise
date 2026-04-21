@@ -7,8 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+
+try:
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import Engine
+except Exception:  # pragma: no cover - optional dependency in lightweight test envs
+    create_engine = None
+    text = None
+    Engine = Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +203,8 @@ class SQLAlchemyConnector(DatabaseConnector):
         self.read_only = read_only
 
     def _engine(self) -> Engine:
+        if create_engine is None:
+            raise RuntimeError("sqlalchemy is required for SQLAlchemyConnector support.")
         return create_engine(self.dsn, future=True)
 
     def _readonly_sql(self) -> str:

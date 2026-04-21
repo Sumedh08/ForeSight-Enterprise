@@ -14,7 +14,8 @@ from infra.connection_profiles import ConnectionProfileManager
 from infra.mindsdb_client import MindsDBClient
 from infra.runtime_services import RuntimeServices
 from infra.settings import settings
-from infra.wren_client import WrenClient
+from infra.training_store import TrainingStore
+from infra.vanna_engine import VannaSemanticCache
 from orchestrator.enterprise_orchestrator import EnterpriseOrchestrator
 
 
@@ -25,13 +26,15 @@ async def lifespan(app: FastAPI):
 
     connection_manager = ConnectionProfileManager()
     airflow_client = AirflowClient()
-    wren_client = WrenClient()
     mindsdb_client = MindsDBClient(connection_manager)
+    training_store = TrainingStore()
+    vanna_cache = VannaSemanticCache()
     services = RuntimeServices(
         connection_manager=connection_manager,
         airflow_client=airflow_client,
-        wren_client=wren_client,
         mindsdb_client=mindsdb_client,
+        training_store=training_store,
+        vanna_cache=vanna_cache,
     )
     app.state.services = services
     app.state.orchestrator = EnterpriseOrchestrator(services=services)

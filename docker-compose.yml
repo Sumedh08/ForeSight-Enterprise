@@ -15,26 +15,28 @@ x-airflow-common:
     - ./airflow/plugins:/opt/airflow/plugins
   depends_on:
     redis:
-      condition: service_healthy
+      condition: service_started
     postgres:
-      condition: service_healthy
+      condition: service_started
 
 services:
   backend:
     build:
       context: .
       dockerfile: Dockerfile.api
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
     environment:
       - APP_ENV=production
       - API_HOST=0.0.0.0
       - API_PORT=8000
       - NIM_BASE_URL=${NIM_BASE_URL:-https://integrate.api.nvidia.com/v1}
-      - NIM_MODEL=${NIM_MODEL:-qwen/qwen2.5-coder-7b-instruct}
+      - NIM_MODEL=${NIM_MODEL:-meta/llama-3.1-8b-instruct}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY}
       - POSTGRES_DSN=${POSTGRES_DSN:-postgresql://admin:adminpassword@postgres:5432/natwest_db}
-      - WREN_ENGINE_URL=http://wren-engine:8080
-      - WREN_AI_SERVICE_URL=http://wren-ai-service:5555
-      - MINDSDB_API_URL=http://mindsdb:47334/api/sql
+      - MINDSDB_API_URL=http://mindsdb:47334/api/sql/query
       - AIRFLOW_BASE_URL=http://airflow-webserver:8080
       - AIRFLOW_USERNAME=airflow
       - AIRFLOW_PASSWORD=airflow
@@ -45,12 +47,8 @@ services:
       - ./:/app
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
       mindsdb:
-        condition: service_started
-      wren-ai-service:
-        condition: service_started
-      wren-engine:
         condition: service_started
       airflow-webserver:
         condition: service_started
@@ -59,6 +57,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.frontend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
       - API_URL=http://backend:8000
     ports:
@@ -70,6 +72,10 @@ services:
 
   postgres:
     image: postgres:15
+    deploy:
+      resources:
+        limits:
+          memory: 400M
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: adminpassword
@@ -86,6 +92,10 @@ services:
 
   redis:
     image: redis:latest
+    deploy:
+      resources:
+        limits:
+          memory: 128M
     ports:
       - "6379:6379"
     healthcheck:
@@ -105,17 +115,21 @@ services:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://admin:adminpassword@postgres:5432/airflow
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
 
   airflow-webserver:
     <<: *airflow-common
     command: webserver
+    deploy:
+      resources:
+        limits:
+          memory: 768M
     ports:
-      - "8080:8080"
+      - "8082:8080"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 45s
+      timeout: 20s
       retries: 5
     restart: always
     environment:
@@ -125,6 +139,10 @@ services:
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
+    deploy:
+      resources:
+        limits:
+          memory: 768M
     restart: always
     environment:
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://admin:adminpassword@postgres:5432/airflow
@@ -132,6 +150,10 @@ services:
 
   mindsdb:
     image: mindsdb/mindsdb
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
     ports:
       - '47334:47334'
       - '47335:47335'
@@ -139,10 +161,14 @@ services:
       - ./data/mindsdb_data:/root/mindsdb_data
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
 
   cubejs:
     image: cubejs/cube:latest
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     ports:
       - 4000:4000
       - 3000:3000
@@ -158,49 +184,9 @@ services:
       - ./cube/schema:/cube/conf/schema
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
 
-  qdrant:
-    image: qdrant/qdrant:v1.7.4
-    ports:
-      - 6333:6333
-      - 6334:6334
-    volumes:
-      - ./data/qdrant_data:/qdrant/storage
-
-  wren-engine:
-    image: ghcr.io/canner/wren-engine:latest
-    ports:
-      - 8081:8080
-    environment:
-      - WREN_ENGINE_SQL_PORT=8080
-
-  wren-ai-service:
-    image: ghcr.io/canner/wren-ai-service:latest
-    ports:
-      - 5555:5555
-    environment:
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-      - LLM_PROVIDER=openai
-      - OPENAI_API_BASE=https://integrate.api.nvidia.com/v1
-      - OPENAI_API_KEY=${NVIDIA_API_KEY}
-      - LLM_MODEL=${NIM_MODEL:-qwen/qwen2.5-coder-7b-instruct}
-    depends_on:
-      - qdrant
-
-  wren-ui:
-    image: ghcr.io/canner/wren-ui:latest
-    ports:
-      - 3001:3000
-    environment:
-      - NEXT_PUBLIC_WREN_ENGINE_ENDPOINT=http://localhost:8081
-      - NEXT_PUBLIC_WREN_AI_ENDPOINT=http://localhost:5555
-    depends_on:
-      - wren-engine
-      - wren-ai-service
 
 volumes:
   postgres_data:
   mindsdb_data:
-  qdrant_data:

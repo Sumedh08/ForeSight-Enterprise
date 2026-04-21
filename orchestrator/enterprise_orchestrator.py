@@ -9,14 +9,19 @@ import json
 import re
 import statistics
 import time
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
-from api.models.schemas import ForecastArtifact, QueryRequest, QueryResponse, SQLArtifact, ScenarioArtifact, WarningItem
+from api.models.schemas import ForecastArtifact, QueryRequest, QueryResponse, SQLArtifact, ScenarioArtifact, TrainingArtifact, WarningItem
+from components.connectors import DatabaseSchema, serialize_schema
+from components.forecasting import SeasonalNaiveForecaster
 from infra.metrics import warning
 from infra.nim_gateway import nim_gateway
 from infra.runtime_services import RuntimeServices
 from infra.settings import settings
+from infra.training_store import TrainingJobRecord
+from infra.vanna_engine import VannaSemanticError, vanna_engine
 from safety.sql_guard import guard_sql
 
 
@@ -50,15 +55,6 @@ def _to_iso(value: Any) -> Any:
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return value
-
-
-def _schema_context(schema: Any, table_limit: int = 20) -> str:
-    lines = [f"Dialect: {getattr(schema, 'dialect', 'unknown')}"]
-    for table in schema.tables[:table_limit]:
-        lines.append(f"Table {table.name}:")
-        for column in table.columns[:30]:
-            lines.append(f"- {column.name} ({column.data_type})")
-    return "\n".join(lines)
 
 
 class EnterpriseOrchestrator:
@@ -140,57 +136,56 @@ class EnterpriseOrchestrator:
             )
         latency["schema_introspection"] = round((time.perf_counter() - t0) * 1000, 1)
 
-        t0 = time.perf_counter()
         try:
-            generated_sql = await self.services.wren_client.generate_sql(
-                request.question,
-                schema_context=_schema_context(schema),
+            sql, tables = await self._resolve_grounding_sql(
+                question=request.question,
+                schema=schema,
+                connector=connector,
+                allowed_tables=allowed_tables,
+                cache_key=f"sql::{request.question}",
+                row_cap=settings.default_row_cap,
+                warnings=warnings,
+                series_mode=False,
+                latency=latency,
             )
-        except Exception as exc:
+        except VannaSemanticError:
             return QueryResponse(
                 status="blocked",
                 task_type="sql",
-                answer="Wren SQL generation is unavailable right now.",
+                answer="I couldn't map that request to a known metric. Define a new metric and try again.",
                 confidence=0.0,
-                warnings=_warning_items([warning("degraded_mode", f"Wren error: {exc}")]),
+                warnings=_warning_items([warning("data_quality", "Vanna could not map the request to a known metric.")]),
                 artifacts=None,
                 latency_ms=latency,
             )
-        latency["wren_generation"] = round((time.perf_counter() - t0) * 1000, 1)
-
-        t0 = time.perf_counter()
-        try:
-            guarded = guard_sql(
-                generated_sql,
-                dialect=schema.dialect,
-                allowed_tables=allowed_tables,
-                row_cap=settings.default_row_cap,
-            )
-            connector.dry_run(guarded.sql)
-        except Exception as exc:
-            warnings.append(warning("safety_block", f"SQL blocked by safety guard: {exc}"))
+        except ValueError as exc:
             return QueryResponse(
                 status="blocked",
                 task_type="sql",
                 answer="The generated SQL failed safety validation and was blocked.",
                 confidence=0.0,
-                warnings=_warning_items(warnings),
-                artifacts=SQLArtifact(
-                    generated_sql=generated_sql,
-                    selected_tables=[],
-                    validation_status="failed",
-                    row_count=0,
-                    preview_rows=[],
-                ),
+                warnings=_warning_items([warning("safety_block", str(exc))]),
+                artifacts=None,
                 latency_ms=latency,
             )
-        latency["sql_validation"] = round((time.perf_counter() - t0) * 1000, 1)
+        except Exception as exc:
+            return QueryResponse(
+                status="blocked",
+                task_type="sql",
+                answer="Autonomous SQL generation is unavailable right now.",
+                confidence=0.0,
+                warnings=_warning_items(warnings or [warning("degraded_mode", str(exc))]),
+                artifacts=None,
+                latency_ms=latency,
+            )
 
         t0 = time.perf_counter()
         try:
-            execution = connector.execute(guarded.sql, preview_limit=50)
+            execution = connector.execute(sql, preview_limit=50)
             rows = execution.rows
         except Exception as exc:
+            if latency.get("cache_hit", 0.0) == 1.0:
+                self.services.vanna_cache.invalidate(question=f"sql::{request.question}", sql=sql)
             warnings.append(warning("degraded_mode", f"Execution failed: {exc}"))
             return QueryResponse(
                 status="blocked",
@@ -199,8 +194,8 @@ class EnterpriseOrchestrator:
                 confidence=0.0,
                 warnings=_warning_items(warnings),
                 artifacts=SQLArtifact(
-                    generated_sql=guarded.sql,
-                    selected_tables=guarded.tables,
+                    generated_sql=sql,
+                    selected_tables=tables,
                     validation_status="valid",
                     row_count=0,
                     preview_rows=[],
@@ -220,8 +215,8 @@ class EnterpriseOrchestrator:
             confidence=confidence,
             warnings=_warning_items(warnings),
             artifacts=SQLArtifact(
-                generated_sql=guarded.sql,
-                selected_tables=guarded.tables,
+                generated_sql=sql,
+                selected_tables=tables,
                 validation_status="valid",
                 row_count=execution.row_count,
                 preview_rows=[{key: _to_iso(value) for key, value in row.items()} for row in rows],
@@ -251,72 +246,276 @@ class EnterpriseOrchestrator:
                 latency_ms=latency,
             )
 
-        if profile.get("type") in {"postgres", "mysql"}:
-            try:
-                await self.services.mindsdb_client.ensure_datasource(profile)
-            except Exception as exc:
-                warnings.append(warning("degraded_mode", f"MindsDB datasource sync warning: {exc}"))
+        latency["schema_introspection"] = round((time.perf_counter() - t0) * 1000, 1)
+        allowed_tables = {table.name for table in schema.tables}
 
         try:
-            predictor = request.series_id or await self.services.mindsdb_client.resolve_predictor(
+            sql, tables = await self._resolve_grounding_sql(
                 question=request.question,
-                table_names=table_names,
+                schema=schema,
+                connector=connector,
+                allowed_tables=allowed_tables,
+                cache_key=f"series::{request.question}",
+                row_cap=5000,
+                warnings=warnings,
+                series_mode=True,
+                latency=latency,
+            )
+        except VannaSemanticError:
+            return QueryResponse(
+                status="blocked",
+                task_type="forecast",
+                answer="I couldn't map that request to a known metric. Define a new metric and try again.",
+                confidence=0.0,
+                warnings=_warning_items([warning("data_quality", "Vanna could not map the forecast request to a known metric.")]),
+                artifacts=None,
+                latency_ms=latency,
+            )
+        except ValueError as exc:
+            return QueryResponse(
+                status="blocked",
+                task_type="forecast",
+                answer="The grounded forecast query failed safety validation and was blocked.",
+                confidence=0.0,
+                warnings=_warning_items([warning("safety_block", str(exc))]),
+                artifacts=None,
+                latency_ms=latency,
             )
         except Exception as exc:
             return QueryResponse(
                 status="blocked",
                 task_type="forecast",
-                answer="MindsDB predictor discovery failed.",
+                answer="Vanna could not ground a historical time series for this request.",
+                confidence=0.0,
+                warnings=_warning_items(warnings or [warning("degraded_mode", str(exc))]),
+                artifacts=None,
+                latency_ms=latency,
+            )
+
+        t0 = time.perf_counter()
+        try:
+            execution = connector.execute(sql, preview_limit=5000)
+            grounded_rows = execution.rows
+        except Exception as exc:
+            if latency.get("cache_hit", 0.0) == 1.0:
+                self.services.vanna_cache.invalidate(question=f"series::{request.question}", sql=sql)
+            return QueryResponse(
+                status="blocked",
+                task_type="forecast",
+                answer="The grounded forecast query failed to execute.",
                 confidence=0.0,
                 warnings=_warning_items([warning("degraded_mode", str(exc))]),
                 artifacts=None,
                 latency_ms=latency,
             )
+        latency["grounding_execution"] = round((time.perf_counter() - t0) * 1000, 1)
 
-        if not predictor:
-            warnings.append(warning("data_quality", "No predictor matched this request."))
+        historical_series = self._rows_to_series(grounded_rows)
+        if len(historical_series) < 8:
             return QueryResponse(
                 status="blocked",
                 task_type="forecast",
-                answer="No trained MindsDB predictor is available yet. Upload data and trigger training first.",
+                answer="The system could not ground enough historical data for forecasting. Try another query or provide more data.",
                 confidence=0.0,
-                warnings=_warning_items(warnings),
+                warnings=_warning_items([warning("data_quality", "Forecast grounding requires a historical `period`/`value` series.")]),
                 artifacts=None,
                 latency_ms=latency,
             )
 
-        try:
-            rows = await self.services.mindsdb_client.run_predictor(predictor=predictor, row_cap=200)
-        except Exception as exc:
-            warnings.append(warning("degraded_mode", str(exc)))
+        job = await self._resolve_training_job(request=request, table_names=tables)
+        if job is None:
             return QueryResponse(
                 status="blocked",
                 task_type="forecast",
-                answer="MindsDB inference failed.",
+                answer="I could not find a trained forecasting metric for this request. Define a new metric and try again.",
                 confidence=0.0,
+                warnings=_warning_items([warning("data_quality", "No matching MindsDB training job was found for the grounded metric.")]),
+                artifacts=None,
+                latency_ms=latency,
+            )
+
+        t0 = time.perf_counter()
+        refreshed_job = await self._refresh_training_job(job)
+        latency["mindsdb_status_lookup"] = round((time.perf_counter() - t0) * 1000, 1)
+        preview = self._build_preview_baseline(
+            historical_series=historical_series,
+            question=request.question,
+            requested_horizon=request.horizon,
+            requested_grain=request.grain,
+        )
+
+        if refreshed_job.state in {"queued", "training"}:
+            return QueryResponse(
+                status="training",
+                task_type="forecast",
+                answer=f"AI Learning: {refreshed_job.progress_pct}% Ready. Returning a seasonal naive preview while MindsDB finishes training `{refreshed_job.predictor_name}`.",
+                confidence=0.56,
                 warnings=_warning_items(warnings),
+                artifacts=TrainingArtifact(
+                    series_id=refreshed_job.series_id,
+                    predictor_name=refreshed_job.predictor_name,
+                    state=refreshed_job.state,
+                    progress_pct=refreshed_job.progress_pct,
+                    message=refreshed_job.message,
+                    poll_after_ms=refreshed_job.poll_after_ms,
+                    preview_baseline=preview,
+                ),
+                latency_ms=latency,
+            )
+
+        if refreshed_job.state == "failed":
+            if preview:
+                return QueryResponse(
+                    status="degraded",
+                    task_type="forecast",
+                    answer=(
+                        f"MindsDB predictor `{refreshed_job.predictor_name}` is unavailable, so I am returning "
+                        "a deterministic seasonal naive baseline instead."
+                    ),
+                    confidence=0.42,
+                    warnings=_warning_items(warnings + [warning("model_risk", refreshed_job.message)]),
+                    artifacts=ForecastArtifact(
+                        series_id=refreshed_job.series_id,
+                        baseline=self._serialize_history(historical_series, limit=24),
+                        point_forecast=preview,
+                        prediction_intervals=[],
+                        anomalies=[],
+                        backtest_metrics={
+                            "source": "seasonal_naive_fallback",
+                            "predictor_failure": refreshed_job.message,
+                            "grounded_tables": tables,
+                        },
+                    ),
+                    latency_ms=latency,
+                )
+            return QueryResponse(
+                status="blocked",
+                task_type="forecast",
+                answer=f"MindsDB could not build predictor `{refreshed_job.predictor_name}`.",
+                confidence=0.0,
+                warnings=_warning_items(warnings + [warning("model_risk", refreshed_job.message)]),
+                artifacts=TrainingArtifact(
+                    series_id=refreshed_job.series_id,
+                    predictor_name=refreshed_job.predictor_name,
+                    state="failed",
+                    progress_pct=refreshed_job.progress_pct,
+                    message=refreshed_job.message,
+                    poll_after_ms=refreshed_job.poll_after_ms,
+                    preview_baseline=preview,
+                ),
+                latency_ms=latency,
+            )
+
+        t0 = time.perf_counter()
+        try:
+            rows = await self.services.mindsdb_client.run_predictor(
+                predictor=refreshed_job.predictor_name,
+                row_cap=max(100, request.horizon or 26),
+            )
+            point_forecast = self._rows_to_forecast_points(
+                rows,
+                period_hint=refreshed_job.date_column,
+                value_hint=refreshed_job.value_column,
+            )
+        except Exception as exc:
+            state, progress_pct, message = await self.services.mindsdb_client.get_predictor_state(refreshed_job.predictor_name)
+            try:
+                updated = self.services.training_store.update_job(
+                    refreshed_job.series_id,
+                    state=state,
+                    progress_pct=progress_pct,
+                    message=message,
+                )
+            except Exception:
+                updated = None
+            current_job = updated or replace(refreshed_job, state=state, progress_pct=progress_pct, message=message)
+            if state in {"queued", "training"}:
+                return QueryResponse(
+                    status="training",
+                    task_type="forecast",
+                    answer=f"AI Learning: {current_job.progress_pct}% Ready. MindsDB is still training `{current_job.predictor_name}`.",
+                    confidence=0.56,
+                    warnings=_warning_items(warnings),
+                    artifacts=TrainingArtifact(
+                        series_id=current_job.series_id,
+                        predictor_name=current_job.predictor_name,
+                        state=current_job.state,
+                        progress_pct=current_job.progress_pct,
+                        message=current_job.message,
+                        poll_after_ms=current_job.poll_after_ms,
+                        preview_baseline=preview,
+                    ),
+                    latency_ms=latency,
+                )
+            if preview:
+                return QueryResponse(
+                    status="degraded",
+                    task_type="forecast",
+                    answer=(
+                        f"MindsDB predictor `{current_job.predictor_name}` is unavailable, so I am returning "
+                        "a deterministic seasonal naive baseline instead."
+                    ),
+                    confidence=0.42,
+                    warnings=_warning_items(warnings + [warning("model_risk", current_job.message)]),
+                    artifacts=ForecastArtifact(
+                        series_id=current_job.series_id,
+                        baseline=self._serialize_history(historical_series, limit=24),
+                        point_forecast=preview,
+                        prediction_intervals=[],
+                        anomalies=[],
+                        backtest_metrics={
+                            "source": "seasonal_naive_fallback",
+                            "predictor_failure": current_job.message,
+                            "grounded_tables": tables,
+                        },
+                    ),
+                    latency_ms=latency,
+                )
+            return QueryResponse(
+                status="blocked",
+                task_type="forecast",
+                answer="MindsDB inference failed for this predictor.",
+                confidence=0.0,
+                warnings=_warning_items(warnings + [warning("degraded_mode", str(exc))]),
                 artifacts=None,
                 latency_ms=latency,
             )
         latency["mindsdb_inference"] = round((time.perf_counter() - t0) * 1000, 1)
 
-        point_forecast = self._rows_to_forecast_points(rows)
         if not point_forecast:
-            warnings.append(warning("model_risk", "Predictor returned rows, but period/value columns could not be resolved."))
+            return QueryResponse(
+                status="blocked",
+                task_type="forecast",
+                answer="MindsDB returned no forecast points for this predictor.",
+                confidence=0.0,
+                warnings=_warning_items(warnings + [warning("model_risk", "Predictor output did not expose a usable `period`/`value` series.")]),
+                artifacts=None,
+                latency_ms=latency,
+            )
 
+        answer = await self._summarize_forecast(
+            question=request.question,
+            historical_series=historical_series,
+            forecast_points=point_forecast,
+            predictor_name=refreshed_job.predictor_name,
+        )
         return QueryResponse(
-            status="ok" if point_forecast else "degraded",
+            status="ok",
             task_type="forecast",
-            answer=f"Generated forecast using predictor `{predictor}` with {len(point_forecast)} projected points.",
-            confidence=0.78 if point_forecast else 0.45,
+            answer=answer,
+            confidence=0.83,
             warnings=_warning_items(warnings),
             artifacts=ForecastArtifact(
-                series_id=predictor,
-                baseline=[],
+                series_id=refreshed_job.series_id,
+                baseline=self._serialize_history(historical_series, limit=24),
                 point_forecast=point_forecast,
                 prediction_intervals=[],
                 anomalies=[],
-                backtest_metrics={},
+                backtest_metrics={
+                    "source": "mindsdb",
+                    "grounded_tables": tables,
+                    "cache_hit": bool(latency.get("cache_hit", 0.0)),
+                },
             ),
             latency_ms=latency,
         )
@@ -436,6 +635,167 @@ class EnterpriseOrchestrator:
             latency_ms=sql_result.latency_ms,
         )
 
+    async def _resolve_grounding_sql(
+        self,
+        *,
+        question: str,
+        schema: DatabaseSchema,
+        connector: Any,
+        allowed_tables: set[str],
+        cache_key: str,
+        row_cap: int,
+        warnings: list[dict[str, str]],
+        series_mode: bool,
+        latency: dict[str, float],
+    ) -> tuple[str, list[str]]:
+        t0 = time.perf_counter()
+        cache_entry = self.services.vanna_cache.lookup(cache_key)
+        latency["semantic_cache_lookup"] = round((time.perf_counter() - t0) * 1000, 1)
+        latency["cache_hit"] = 0.0
+
+        if cache_entry is not None:
+            try:
+                guarded = guard_sql(
+                    cache_entry.sql,
+                    dialect=schema.dialect,
+                    allowed_tables=allowed_tables,
+                    row_cap=row_cap,
+                )
+                connector.dry_run(guarded.sql)
+                latency["cache_hit"] = 1.0
+                latency["sql_validation"] = 0.0
+                return guarded.sql, guarded.tables
+            except Exception:
+                self.services.vanna_cache.invalidate(question=cache_key, sql=cache_entry.sql)
+                warnings.append(warning("performance", "Semantic cache entry was stale and has been invalidated."))
+
+        schema_context = serialize_schema(schema)
+        t0 = time.perf_counter()
+        
+        # When grounding a forecast, we need the historical DATA for the metric, 
+        # not a query filtered for the future date in the question.
+        vanna_question = question
+        if series_mode:
+            vanna_question = f"Select the full historical time-series (all dates and values) needed to answer: {question}"
+            
+        generated_sql = await vanna_engine.generate_sql(vanna_question)
+        latency["vanna_generation"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        t0 = time.perf_counter()
+        guarded = guard_sql(
+            generated_sql,
+            dialect=schema.dialect,
+            allowed_tables=allowed_tables,
+            row_cap=row_cap,
+        )
+        connector.dry_run(guarded.sql)
+        latency["sql_validation"] = round((time.perf_counter() - t0) * 1000, 1)
+        self.services.vanna_cache.remember(question=cache_key, sql=guarded.sql, selected_tables=guarded.tables)
+        return guarded.sql, guarded.tables
+
+    async def _resolve_training_job(self, *, request: QueryRequest, table_names: list[str]) -> TrainingJobRecord | None:
+        if request.series_id:
+            direct = self.services.training_store.get_job(series_id=request.series_id)
+            if direct is not None:
+                return direct
+        return self.services.training_store.match_job(
+            question=request.question,
+            metric_hint=request.metric,
+            table_names=table_names,
+        )
+
+    async def _refresh_training_job(self, job: TrainingJobRecord) -> TrainingJobRecord:
+        if job.state not in {"queued", "training"}:
+            return job
+        try:
+            state, progress_pct, message = await self.services.mindsdb_client.get_predictor_state(job.predictor_name)
+            try:
+                updated = self.services.training_store.update_job(
+                    job.series_id,
+                    state=state,
+                    progress_pct=progress_pct,
+                    message=message,
+                )
+            except Exception:
+                updated = None
+            return updated or replace(job, state=state, progress_pct=progress_pct, message=message)
+        except Exception:
+            return job
+
+    async def _summarize_forecast(
+        self,
+        *,
+        question: str,
+        historical_series: list[dict[str, Any]],
+        forecast_points: list[dict[str, Any]],
+        predictor_name: str,
+    ) -> str:
+        if nim_gateway.enabled:
+            try:
+                prompt = (
+                    "You are an enterprise analytics analyst.\n"
+                    "Write a short narrative using only the historical series and forecast output below.\n"
+                    "Do not mention SQL, models, or hidden steps. Mention magnitude and direction clearly.\n\n"
+                    f"Question: {question}\n"
+                    f"Predictor: {predictor_name}\n"
+                    f"Historical series: {json.dumps(self._serialize_history(historical_series, limit=12), default=str)}\n"
+                    f"Forecast points: {json.dumps(forecast_points[:12], default=str)}"
+                )
+                response = await nim_gateway.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=220)
+                if response.strip():
+                    return response.strip()
+            except Exception:
+                pass
+
+        first = forecast_points[0]
+        last = forecast_points[-1]
+        return (
+            f"Forecast complete using predictor `{predictor_name}`. "
+            f"The outlook moves from {round(float(first['value']), 4)} to {round(float(last['value']), 4)} "
+            f"across {len(forecast_points)} projected period(s)."
+        )
+
+    def _build_preview_baseline(
+        self,
+        *,
+        historical_series: list[dict[str, Any]],
+        question: str,
+        requested_horizon: int | None,
+        requested_grain: str | None,
+    ) -> list[dict[str, Any]]:
+        if len(historical_series) < 3:
+            return []
+        grain = self._normalize_grain(requested_grain) or self._infer_grain(historical_series)
+        horizon = self._resolve_forecast_horizon(
+            question=question,
+            grain=grain,
+            last_period=historical_series[-1]["period"],
+            requested_horizon=requested_horizon,
+        )
+        model = SeasonalNaiveForecaster()
+        points = model.predict(historical_series, horizon=horizon, grain=grain)
+        return [
+            {"period": point.period.isoformat(), "value": round(float(point.value), 6)}
+            for point in points
+        ]
+
+    @staticmethod
+    def _serialize_history(series: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+        return [
+            {"period": item["period"].isoformat(), "value": round(float(item["value"]), 6)}
+            for item in series[-min(len(series), limit):]
+        ]
+
+    def _rows_to_series(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        points = self._rows_to_forecast_points(rows)
+        series: list[dict[str, Any]] = []
+        for point in points:
+            period = self._parse_datetime(point.get("period"))
+            if period is None:
+                continue
+            series.append({"period": period, "value": float(point["value"])})
+        return series
+
     async def _summarize_rows(self, *, question: str, rows: list[dict[str, Any]]) -> str:
         if not rows:
             return "The query executed successfully but returned no rows."
@@ -458,12 +818,18 @@ class EnterpriseOrchestrator:
         preview = ", ".join(f"{key}={value}" for key, value in list(first.items())[:4])
         return f"Query returned {len(rows)} preview row(s). First row: {preview}."
 
-    def _rows_to_forecast_points(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rows_to_forecast_points(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        period_hint: str | None = None,
+        value_hint: str | None = None,
+    ) -> list[dict[str, Any]]:
         if not rows:
             return []
         columns = list(rows[0].keys())
-        period_key = self._detect_period_column(columns, rows)
-        value_key = self._detect_numeric_column(columns, rows)
+        period_key = self._detect_period_column(columns, rows, preferred=period_hint)
+        value_key = self._detect_numeric_column(columns, rows, preferred=value_hint)
         if not period_key or not value_key:
             return []
 
@@ -524,6 +890,88 @@ class EnterpriseOrchestrator:
         return anomalies, series
 
     @staticmethod
+    def _normalize_grain(grain: str | None) -> str | None:
+        if grain is None:
+            return None
+        lowered = str(grain).strip().lower()
+        mapping = {
+            "d": "day",
+            "day": "day",
+            "daily": "day",
+            "w": "week",
+            "week": "week",
+            "weekly": "week",
+            "m": "month",
+            "month": "month",
+            "monthly": "month",
+        }
+        return mapping.get(lowered)
+
+    def _infer_grain(self, series: list[dict[str, Any]]) -> str:
+        if len(series) < 3:
+            return "week"
+        day_diffs: list[float] = []
+        for index in range(1, len(series)):
+            previous = series[index - 1]["period"]
+            current = series[index]["period"]
+            delta_days = (current - previous).total_seconds() / 86400
+            if delta_days > 0:
+                day_diffs.append(delta_days)
+        if not day_diffs:
+            return "week"
+        median_days = statistics.median(day_diffs)
+        if median_days <= 2:
+            return "day"
+        if median_days <= 12:
+            return "week"
+        return "month"
+
+    def _resolve_forecast_horizon(
+        self,
+        *,
+        question: str,
+        grain: str,
+        last_period: datetime,
+        requested_horizon: int | None,
+    ) -> int:
+        if isinstance(requested_horizon, int) and requested_horizon > 0:
+            return min(requested_horizon, 520)
+
+        target_date = self._extract_target_date(question)
+        if target_date is not None and target_date > last_period:
+            delta_days = (target_date - last_period).total_seconds() / 86400
+            if grain == "day":
+                return min(max(1, int(delta_days) + 1), 520)
+            if grain == "week":
+                return min(max(1, int(delta_days / 7) + 1), 520)
+            month_span = (target_date.year - last_period.year) * 12 + (target_date.month - last_period.month)
+            if target_date.day > last_period.day:
+                month_span += 1
+            return min(max(1, month_span), 520)
+
+        defaults = {"day": 30, "week": 12, "month": 6}
+        return defaults.get(grain, 12)
+
+    @staticmethod
+    def _extract_target_date(question: str) -> datetime | None:
+        patterns = [
+            (r"\b\d{4}-\d{2}-\d{2}\b", ["%Y-%m-%d"]),
+            (r"\b\d{1,2}/\d{1,2}/\d{4}\b", ["%d/%m/%Y", "%m/%d/%Y"]),
+            (r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b", ["%d %b %Y", "%d %B %Y"]),
+        ]
+        for regex, formatters in patterns:
+            match = re.search(regex, question)
+            if not match:
+                continue
+            token = match.group(0)
+            for formatter in formatters:
+                try:
+                    return datetime.strptime(token, formatter)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
     def _parse_datetime(value: Any) -> datetime | None:
         if isinstance(value, datetime):
             return value
@@ -543,7 +991,11 @@ class EnterpriseOrchestrator:
             return None
 
     @staticmethod
-    def _detect_period_column(columns: list[str], rows: list[dict[str, Any]]) -> str | None:
+    def _detect_period_column(columns: list[str], rows: list[dict[str, Any]], preferred: str | None = None) -> str | None:
+        if preferred:
+            for column in columns:
+                if column.lower() == preferred.lower():
+                    return column
         lowered = {column: column.lower() for column in columns}
         for column, lowered_name in lowered.items():
             if any(token in lowered_name for token in ("date", "time", "period", "timestamp", "ds")):
@@ -557,8 +1009,16 @@ class EnterpriseOrchestrator:
         return None
 
     @staticmethod
-    def _detect_numeric_column(columns: list[str], rows: list[dict[str, Any]]) -> str | None:
+    def _detect_numeric_column(columns: list[str], rows: list[dict[str, Any]], preferred: str | None = None) -> str | None:
         blocked = {"is_forecast", "confidence", "lower", "upper"}
+        if preferred:
+            for column in columns:
+                if column.lower() == preferred.lower():
+                    try:
+                        float(rows[0].get(column))
+                        return column
+                    except Exception:
+                        pass
         for column in columns:
             if column.lower() in blocked:
                 continue

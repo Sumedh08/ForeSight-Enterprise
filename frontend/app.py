@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import altair as alt
@@ -105,6 +106,81 @@ def render_anomaly_chart(artifacts: dict[str, Any]) -> alt.Chart | None:
     return alt.layer(line, dots).properties(height=320, title="Anomaly Scan")
 
 
+def render_training_chart(artifacts: dict[str, Any]) -> alt.Chart | None:
+    preview = pd.DataFrame(artifacts.get("preview_baseline", []))
+    if preview.empty or not {"period", "value"}.issubset(preview.columns):
+        return None
+    preview["period"] = pd.to_datetime(preview["period"])
+    return (
+        alt.Chart(preview)
+        .mark_line(point=True, color="#D97706")
+        .encode(
+            x="period:T",
+            y="value:Q",
+            tooltip=[alt.Tooltip("period:T", title="Period"), alt.Tooltip("value:Q", title="Preview")],
+        )
+        .properties(height=320, title="Training Preview")
+    )
+
+
+def render_training_jobs(jobs: list[dict[str, Any]]) -> None:
+    if not jobs:
+        st.caption("No recent training jobs.")
+        return
+    for job in jobs:
+        label = f"{job.get('series_id', 'unknown')} [{job.get('state', 'queued')}]"
+        st.caption(label)
+        st.progress(max(0.0, min(float(job.get("progress_pct", 0)) / 100.0, 1.0)))
+        st.caption(job.get("message", ""))
+
+
+def build_response_view(response: dict[str, Any]) -> tuple[str, alt.Chart | None, pd.DataFrame | None, str, list[str], dict[str, Any] | None]:
+    answer = response.get("answer", "No answer returned.")
+    confidence = response.get("confidence")
+    if confidence is not None:
+        answer = f"Confidence: {int(float(confidence) * 100)}%\n\n{answer}"
+
+    chart = None
+    table = None
+    artifacts = response.get("artifacts")
+    task_type = response.get("task_type")
+    status = response.get("status")
+    if artifacts:
+        if status == "training":
+            chart = render_training_chart(artifacts)
+            table = pd.DataFrame(artifacts.get("preview_baseline", []))
+        elif task_type == "sql":
+            table = render_sql_table(artifacts)
+        elif task_type == "forecast":
+            chart = render_forecast_chart(artifacts)
+            table = pd.DataFrame(artifacts.get("point_forecast", []))
+        elif task_type == "scenario":
+            chart = render_scenario_chart(artifacts)
+            table = pd.DataFrame(artifacts.get("scenario_forecast", []))
+        elif task_type == "anomaly":
+            chart = render_anomaly_chart(artifacts)
+            table = pd.DataFrame(artifacts.get("anomalies", []))
+
+    latency = response.get("latency_ms", {})
+    debug_bits: list[str] = []
+    if "cache_hit" in latency:
+        debug_bits.append("cache hit" if float(latency.get("cache_hit", 0.0)) >= 1.0 else "cache miss")
+    if task_type == "forecast":
+        if status == "training":
+            debug_bits.append("source: seasonal naive preview")
+        elif status == "ok":
+            debug_bits.append("source: mindsdb")
+        elif status == "degraded":
+            debug_bits.append("source: seasonal naive fallback")
+    debug = " | ".join(debug_bits)
+
+    warnings: list[str] = []
+    for item in response.get("warnings", []):
+        if isinstance(item, dict):
+            warnings.append(f"{item.get('kind')}: {item.get('message')}")
+    return answer, chart, table, debug, warnings, artifacts
+
+
 def render_component_status(components: dict[str, str]) -> None:
     for name, state in components.items():
         if state == "up":
@@ -143,6 +219,62 @@ st.title("AI Predictive Forecast Platform")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "pending_training" not in st.session_state:
+    st.session_state.pending_training = None
+
+
+def poll_pending_training() -> None:
+    pending = st.session_state.get("pending_training")
+    if not pending:
+        return
+
+    try:
+        status = api_get(f"/api/data/training?series_id={pending['series_id']}")
+        jobs = status.get("jobs", [])
+        if not jobs:
+            return
+        job = jobs[0]
+        message_index = int(pending.get("message_index", -1))
+        progress_text = f"AI Learning: {job.get('progress_pct', 0)}% Ready.\n\n{job.get('message', '')}"
+        if 0 <= message_index < len(st.session_state.messages):
+            st.session_state.messages[message_index]["content"] = progress_text
+            st.session_state.messages[message_index]["debug"] = "source: seasonal naive preview"
+
+        if job.get("state") == "ready":
+            response = api_post(
+                "/query",
+                {
+                    "question": pending["question"],
+                    "mode": "forecast",
+                    "series_id": pending["series_id"],
+                },
+            )
+            answer, chart, table, debug, warnings, _ = build_response_view(response)
+            if 0 <= message_index < len(st.session_state.messages):
+                st.session_state.messages[message_index] = {
+                    "role": "assistant",
+                    "content": answer,
+                    "chart": chart,
+                    "table": table,
+                    "debug": debug,
+                    "warnings": warnings,
+                }
+            st.session_state.pending_training = None
+            st.rerun()
+
+        if job.get("state") == "failed":
+            if 0 <= message_index < len(st.session_state.messages):
+                st.session_state.messages[message_index]["warnings"] = [job.get("message", "Training failed.")]
+            st.session_state.pending_training = None
+            return
+
+        time.sleep(min(int(job.get("poll_after_ms", 3000)), 5000) / 1000.0)
+        st.rerun()
+    except Exception:
+        return
+
+
+poll_pending_training()
 
 with st.sidebar:
     st.header("Connection Wizard")
@@ -220,14 +352,29 @@ with st.sidebar:
             response.raise_for_status()
             data = response.json()
             st.success(data.get("message", "Upload complete."))
+            if data.get("warehouse_profile"):
+                st.caption(f"Canonical warehouse: {data.get('warehouse_profile')}")
+            for job in data.get("training_jobs", []):
+                st.caption(f"Queued: {job.get('series_id')} -> {job.get('predictor_name')}")
             for item in data.get("warnings", []):
                 st.warning(item)
         except Exception as exc:
             st.error(f"Upload failed: {exc}")
 
+    st.subheader("Training Queue")
+    try:
+        training_status = api_get("/api/data/training")
+        render_training_jobs(training_status.get("jobs", []))
+    except Exception as exc:
+        st.caption(f"Training status unavailable: {exc}")
+
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
+        if message.get("debug"):
+            st.caption(message["debug"])
+        for item in message.get("warnings", []):
+            st.warning(item)
         if message.get("chart") is not None:
             st.altair_chart(message["chart"], use_container_width=True)
         if message.get("table") is not None:
@@ -245,37 +392,15 @@ if prompt:
         try:
             payload = {"question": prompt, "mode": "auto"}
             response = api_post("/query", payload)
-            answer = response.get("answer", "No answer returned.")
-            confidence = response.get("confidence")
-            if confidence is not None:
-                answer = f"Confidence: {int(float(confidence) * 100)}%\n\n{answer}"
+            answer, chart, table, debug, warnings, artifacts = build_response_view(response)
             placeholder.markdown(answer)
-
-            chart = None
-            table = None
-            artifacts = response.get("artifacts")
-            task_type = response.get("task_type")
-            if artifacts:
-                if task_type == "sql":
-                    table = render_sql_table(artifacts)
-                elif task_type == "forecast":
-                    chart = render_forecast_chart(artifacts)
-                    table = pd.DataFrame(artifacts.get("point_forecast", []))
-                elif task_type == "scenario":
-                    chart = render_scenario_chart(artifacts)
-                    table = pd.DataFrame(artifacts.get("scenario_forecast", []))
-                elif task_type == "anomaly":
-                    chart = render_anomaly_chart(artifacts)
-                    table = pd.DataFrame(artifacts.get("anomalies", []))
-
-            for item in response.get("warnings", []):
-                if isinstance(item, dict):
-                    st.warning(f"{item.get('kind')}: {item.get('message')}")
 
             if chart is not None:
                 st.altair_chart(chart, use_container_width=True)
             if table is not None and not table.empty:
                 st.dataframe(table, use_container_width=True)
+            for item in warnings:
+                st.warning(item)
 
             st.session_state.messages.append(
                 {
@@ -283,7 +408,15 @@ if prompt:
                     "content": answer,
                     "chart": chart,
                     "table": table,
+                    "debug": debug,
+                    "warnings": warnings,
                 }
             )
+            if response.get("status") == "training" and artifacts and artifacts.get("series_id"):
+                st.session_state.pending_training = {
+                    "series_id": artifacts.get("series_id"),
+                    "question": prompt,
+                    "message_index": len(st.session_state.messages) - 1,
+                }
         except Exception as exc:
             placeholder.error(f"Query failed: {exc}")

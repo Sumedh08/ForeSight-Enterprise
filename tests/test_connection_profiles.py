@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("sqlalchemy")
 pytest.importorskip("duckdb")
 
-from infra.connection_profiles import ConnectionProfileManager, ConnectionProfileStore
+from infra.connection_profiles import ConnectionProfileManager, ConnectionProfileStore, derive_mindsdb_dsn
 
 
 def test_profile_save_list_activate(tmp_path: Path):
@@ -55,3 +55,8 @@ def test_profile_redacts_secret_fields(tmp_path: Path):
     raw_payload = json.loads(store_path.read_text(encoding="utf-8"))
     raw = next(item for item in raw_payload["profiles"] if item["name"] == "pg-secret")
     assert raw["config"]["password"] == "super-secret"
+
+
+def test_derive_mindsdb_dsn_rewrites_localhost_for_containers():
+    derived = derive_mindsdb_dsn("postgresql://admin:adminpassword@127.0.0.1:5432/natwest_db")
+    assert derived == "postgresql://admin:adminpassword@host.docker.internal:5432/natwest_db"

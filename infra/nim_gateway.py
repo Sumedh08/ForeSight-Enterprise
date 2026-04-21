@@ -22,14 +22,16 @@ class NIMGateway:
         if not self.enabled:
             return "degraded"
         try:
-            await self.chat(
-                [{"role": "user", "content": "Reply with the single word ok."}],
-                max_tokens=8,
-                temperature=0,
-            )
-            return "up"
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.get(
+                    f"{self.base_url}/models",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                if response.status_code < 500:
+                    return "up"
         except Exception:
-            return "degraded"
+            pass
+        return "degraded"
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
     async def chat(

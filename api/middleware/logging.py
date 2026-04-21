@@ -24,7 +24,7 @@ log = structlog.get_logger()
 async def logging_middleware(request: Request, call_next):
     started = time.perf_counter()
     question_preview = ""
-    if request.method == "POST":
+    if request.method == "POST" and request.headers.get("content-type", "").startswith("application/json"):
         try:
             payload = await request.json()
             question = payload.get("question", "") if isinstance(payload, dict) else ""

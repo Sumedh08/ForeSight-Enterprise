@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 from components.connectors import (
     DatabaseConnector,
@@ -37,7 +37,7 @@ def redact_config(config: dict[str, Any]) -> dict[str, Any]:
     redacted: dict[str, Any] = {}
     for key, value in config.items():
         lowered = key.lower()
-        if lowered == "dsn" and value:
+        if lowered in {"dsn", "mindsdb_dsn"} and value:
             text = str(value)
             if "@" in text and "://" in text:
                 prefix, suffix = text.split("@", 1)
@@ -53,8 +53,67 @@ def redact_config(config: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def derive_mindsdb_dsn(dsn: str) -> str | None:
+    text = str(dsn or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return None
+    host = parsed.hostname or ""
+    if host not in {"127.0.0.1", "localhost"}:
+        return None
+    replacement = "host.docker.internal"
+    if parsed.port:
+        netloc = f"{replacement}:{parsed.port}"
+    else:
+        netloc = replacement
+    if parsed.username:
+        credentials = quote_plus(parsed.username)
+        if parsed.password is not None:
+            credentials += ":" + quote_plus(parsed.password)
+        netloc = f"{credentials}@{netloc}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_local_path(path_value: str) -> Path:
+    raw = str(path_value).strip()
+    if not raw:
+        return settings.duckdb_path
+
+    candidate = Path(raw)
+    if candidate.exists():
+        return candidate
+
+    # Handle host-specific absolute paths (for example Windows paths)
+    # that are persisted in profiles and later loaded from Linux containers.
+    if re.match(r"^[A-Za-z]:\\", raw):
+        fallback = settings.data_dir / candidate.name
+        return fallback
+
+    if candidate.is_absolute():
+        return candidate
+    return Path(raw)
+
+
+def _seed_default_duckdb(connector: DuckDBConnector) -> None:
+    sample_sources = {
+        "weekly_sales": settings.data_dir / "weekly_sales.csv",
+        "branches": settings.data_dir / "branches.csv",
+    }
+    for table_name, source_path in sample_sources.items():
+        if not source_path.exists():
+            continue
+        normalized_path = str(source_path).replace("\\", "/")
+        connector.execute(
+            f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM read_csv_auto('{normalized_path}')",
+            preview_limit=1,
+        )
 
 
 @dataclass(slots=True)
@@ -120,6 +179,47 @@ class ConnectionProfileManager:
         payload["profiles"] = [profile]
         payload["active_profile_id"] = profile["id"]
         self.store.save(payload)
+
+    def ensure_enterprise_warehouse_profile(self, *, activate: bool = True) -> dict[str, Any]:
+        dsn = str(settings.postgres_dsn or "").strip()
+        if not dsn:
+            raise ValueError("POSTGRES_DSN is not configured in .env")
+
+        now = utc_now_iso()
+        payload = self.store.all()
+        profiles = payload.get("profiles", [])
+        
+        existing = next((item for item in profiles if item.get("name") == "enterprise-warehouse"), None)
+        if existing:
+            existing["type"] = "postgres"
+            existing_config = {"dsn": dsn}
+            mindsdb_dsn = derive_mindsdb_dsn(dsn)
+            if mindsdb_dsn:
+                existing_config["mindsdb_dsn"] = mindsdb_dsn
+            existing["config"] = existing_config
+            existing["updated_at"] = now
+            if activate:
+                payload["active_profile_id"] = existing["id"]
+            self.store.save(payload)
+            return self.get_profile(existing["id"])
+
+        profile = {
+            "id": str(uuid.uuid4()),
+            "name": "enterprise-warehouse",
+            "type": "postgres",
+            "config": {
+                "dsn": dsn,
+                **({"mindsdb_dsn": derive_mindsdb_dsn(dsn)} if derive_mindsdb_dsn(dsn) else {}),
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+        profiles.append(profile)
+        payload["profiles"] = profiles
+        if activate:
+            payload["active_profile_id"] = profile["id"]
+        self.store.save(payload)
+        return self.get_profile(profile["id"])
 
     def list_profiles(self, *, redact: bool = True) -> list[dict[str, Any]]:
         payload = self.store.all()
@@ -193,7 +293,11 @@ class ConnectionProfileManager:
 
         dsn = str(candidate.get("dsn") or "").strip()
         if dsn:
-            return {"dsn": dsn}
+            normalized = {"dsn": dsn}
+            mindsdb_dsn = str(candidate.get("mindsdb_dsn") or "").strip()
+            if mindsdb_dsn:
+                normalized["mindsdb_dsn"] = mindsdb_dsn
+            return normalized
 
         host = str(candidate.get("host") or "").strip()
         database = str(candidate.get("database") or "").strip()
@@ -210,9 +314,11 @@ class ConnectionProfileManager:
             "password": password,
         }
 
-    def profile_to_dsn(self, profile: dict[str, Any]) -> str:
+    def profile_to_dsn(self, profile: dict[str, Any], *, purpose: str = "app") -> str:
         connection_type = str(profile.get("type"))
         config = profile.get("config", {})
+        if purpose == "mindsdb" and config.get("mindsdb_dsn"):
+            return str(config["mindsdb_dsn"])
         if "dsn" in config and config["dsn"]:
             return str(config["dsn"])
 
@@ -236,9 +342,27 @@ class ConnectionProfileManager:
         connection_type = str(profile.get("type"))
         config = profile.get("config", {})
         if connection_type == "duckdb":
-            return DuckDBConnector(config["path"], read_only=read_only)
+            db_path = _normalize_local_path(str(config.get("path", "")))
+            if not db_path.exists():
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                bootstrap_connector = DuckDBConnector(db_path, read_only=False)
+                bootstrap_connector.execute("SELECT 1", preview_limit=1)
+                _seed_default_duckdb(bootstrap_connector)
+
+            connector = DuckDBConnector(str(db_path), read_only=read_only)
+            try:
+                schema = connector.introspect_schema(sample_limit=1)
+                if not schema.tables:
+                    writable_connector = DuckDBConnector(str(db_path), read_only=False)
+                    _seed_default_duckdb(writable_connector)
+                    connector = DuckDBConnector(str(db_path), read_only=read_only)
+            except Exception:
+                pass
+            return connector
         if connection_type == "sqlite":
-            return SQLiteConnector(config["path"])
+            sqlite_path = _normalize_local_path(str(config.get("path", "")))
+            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+            return SQLiteConnector(str(sqlite_path))
         if connection_type == "postgres":
             return PostgresConnector(self.profile_to_dsn(profile), read_only=read_only)
         if connection_type == "mysql":

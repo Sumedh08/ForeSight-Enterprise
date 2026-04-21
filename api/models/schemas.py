@@ -13,6 +13,15 @@ class WarningItem(BaseModel):
     message: str
 
 
+class TrainingJobSummary(BaseModel):
+    series_id: str
+    predictor_name: str
+    state: Literal["queued", "training", "ready", "failed"]
+    progress_pct: int
+    message: str
+    poll_after_ms: int = 3000
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
     mode: Literal["auto", "sql", "forecast", "anomaly", "scenario"] = "auto"
@@ -42,6 +51,16 @@ class ForecastArtifact(BaseModel):
     backtest_metrics: dict[str, Any]
 
 
+class TrainingArtifact(BaseModel):
+    series_id: str
+    predictor_name: str
+    state: Literal["queued", "training", "ready", "failed"]
+    progress_pct: int
+    message: str
+    poll_after_ms: int
+    preview_baseline: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ScenarioArtifact(BaseModel):
     series_id: str
     baseline_forecast: list[dict[str, Any]]
@@ -53,12 +72,12 @@ class ScenarioArtifact(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    status: Literal["ok", "degraded", "blocked"]
+    status: Literal["ok", "degraded", "blocked", "training"]
     task_type: Literal["sql", "forecast", "anomaly", "scenario", "unclear"]
     answer: str
     confidence: float
     warnings: list[WarningItem]
-    artifacts: SQLArtifact | ForecastArtifact | ScenarioArtifact | None
+    artifacts: SQLArtifact | ForecastArtifact | ScenarioArtifact | TrainingArtifact | None
     latency_ms: dict[str, float]
 
 
@@ -108,4 +127,14 @@ class UploadResponse(BaseModel):
     status: Literal["ok", "degraded", "failed"]
     message: str
     table_name: str | None = None
+    ingestion_id: str | None = None
+    warehouse_profile: str | None = None
+    training_jobs: list[TrainingJobSummary] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class TrainingStatusResponse(BaseModel):
+    status: Literal["ok"]
+    ingestion_id: str | None = None
+    series_id: str | None = None
+    jobs: list[TrainingJobSummary] = Field(default_factory=list)

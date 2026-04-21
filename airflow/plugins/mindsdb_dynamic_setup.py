@@ -9,7 +9,7 @@ import requests
 from sqlalchemy import create_engine, text
 
 
-MINDSDB_SQL_ENDPOINT = os.getenv("MINDSDB_API_URL", "http://mindsdb:47334/api/sql").rstrip("/")
+MINDSDB_SQL_ENDPOINT = os.getenv("MINDSDB_API_URL", "http://mindsdb:47334/api/sql/query").rstrip("/")
 
 
 def _safe_identifier(name: str) -> str:
